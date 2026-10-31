@@ -4,9 +4,10 @@ import argparse
 import logging
 import os
 import sys
+import re
 import yaml
 import json
-from jsonschema import validate, ValidationError
+from jsonschema import validators
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,11 +20,11 @@ def setup_argparse():
         argparse.ArgumentParser: The argument parser object.
     """
     parser = argparse.ArgumentParser(
-        description="Scans Infrastructure-as-Code (IaC) templates for security misconfigurations and external dependencies."
+        description="Lists external dependencies in IaC templates (YAML or JSON) and validates a template against a JSON Schema policy file. It does not check dependencies against any vulnerability database and gives no risk assessment."
     )
     parser.add_argument(
         "iac_file",
-        help="Path to the Infrastructure-as-Code (IaC) file (e.g., Terraform, CloudFormation, Kubernetes manifests)."
+        help="Path to the Infrastructure-as-Code (IaC) file (YAML or JSON, e.g., a Kubernetes manifest or a Terraform .tf.json file)."
     )
     parser.add_argument(
         "--dependency-check",
@@ -33,7 +34,7 @@ def setup_argparse():
     parser.add_argument(
         "--security-check",
         action="store_true",
-        help="Enable security misconfiguration check (IAM permissions, network segmentation, etc.)."
+        help="Validate the IaC file against the JSON Schema policy given with --policy-file."
     )
     parser.add_argument(
         "--policy-file",
@@ -110,20 +111,47 @@ def check_external_dependencies(iac_data):
 
     def find_dependencies(data):
         if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, str):
-                    if "docker.io" in value or "amazonaws.com" in value and "amazonaws.com/containers/" in value:
-                        dependencies.append(value)
-                    if value.startswith(("http://", "https://")) and value.endswith((".sh", ".ps1", ".py")):
-                        dependencies.append(value) #potential for running code on install
-                else:
-                    find_dependencies(value)
+            for value in data.values():
+                find_dependencies(value)
         elif isinstance(data, list):
             for item in data:
                 find_dependencies(item)
+        elif isinstance(data, str):
+            if _is_external_dependency(data):
+                dependencies.append(data)
 
     find_dependencies(iac_data)
     return dependencies
+
+
+_REGISTRY_MARKERS = ("docker.io", "ghcr.io", "quay.io", "amazonaws.com", "gcr.io", "azurecr.io")
+_IMAGE_REF = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+([:@][A-Za-z0-9._:-]+)?$")
+_IMAGE_NAME_TAG = re.compile(r"^[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$")
+
+
+def _is_external_dependency(value):
+    """
+    Tests one string as an external dependency: a known registry host
+    (docker.io, ghcr.io, quay.io, an ECR amazonaws.com host with or
+    without a containers segment, gcr.io, azurecr.io), a script URL
+    (.sh, .ps1, or .py, with any query string or fragment stripped
+    before the suffix test), a git or registry module source string,
+    or a Docker Hub shorthand image reference such as nginx:latest or
+    sentinel/app:1.0.
+    """
+    text = value.strip()
+    lowered = text.lower()
+    bare = lowered.split("?", 1)[0].split("#", 1)[0]
+
+    if any(marker in lowered for marker in _REGISTRY_MARKERS):
+        return True
+    if lowered.startswith(("http://", "https://")) and bare.endswith((".sh", ".ps1", ".py")):
+        return True  # potential for running code on install
+    if lowered.startswith(("git::", "github.com/", "git@")):
+        return True
+    if "://" not in lowered and (_IMAGE_REF.match(text) or _IMAGE_NAME_TAG.match(text)):
+        return True
+    return False
 
 
 def load_policy_file(policy_file_path):
@@ -184,16 +212,24 @@ def validate_security_configuration(iac_data, policy_data):
     violations = []
 
     if iac_data is None or policy_data is None:
-        return violations
+        raise ValueError("Security validation not performed: the IaC data or the policy data failed to load.")
 
-    try:
-        validate(instance=iac_data, schema=policy_data)
-        logging.info("Security validation successful. No violations found.")
-    except ValidationError as e:
+    # Check the schema itself first. An invalid schema raises
+    # jsonschema's SchemaError here, so a policy that cannot be applied
+    # never reads as a clean pass in main.
+    validator_class = validators.validator_for(policy_data)
+    validator_class.check_schema(policy_data)
+
+    errors = sorted(
+        validator_class(policy_data).iter_errors(iac_data),
+        key=lambda e: e.json_path,
+    )
+    for e in errors:
         logging.warning(f"Security violation found: {e.message} at {e.json_path}")
         violations.append(f"{e.message} at {e.json_path}")
-    except Exception as e:
-        logging.error(f"An error occurred during security validation: {e}")
+
+    if not violations:
+        logging.info("Security validation successful. No violations found.")
 
     return violations
 
@@ -212,7 +248,13 @@ def main():
     if not os.path.isfile(args.iac_file):
         logging.error(f"Error: IaC file '{args.iac_file}' does not exist.")
         sys.exit(1)
-    
+
+    # A run with neither check flag would check nothing; refuse it
+    # instead of exiting 0 in silence.
+    if not args.dependency_check and not args.security_check:
+        logging.error("Error: No check was requested. Pass --dependency-check or --security-check; nothing was checked.")
+        sys.exit(2)
+
     # Check if policy file exists, if security check is enabled.
     if args.security_check and not args.policy_file:
         logging.error("Error: --policy-file must be specified when --security-check is enabled.")
@@ -243,7 +285,12 @@ def main():
         if policy_data is None:
             sys.exit(1)
 
-        violations = validate_security_configuration(iac_data, policy_data)
+        try:
+            violations = validate_security_configuration(iac_data, policy_data)
+        except Exception as e:
+            logging.error(f"Security validation could not be performed: {e}")
+            sys.exit(1)
+
         if violations:
             print("Security Violations Found:")
             for violation in violations:
