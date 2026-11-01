@@ -109,6 +109,11 @@ def check_external_dependencies(iac_data):
     if iac_data is None:
         return dependencies
 
+    # The walk visits every string value in the structure, at any depth,
+    # and never looks at keys. Results are collected in walk order with no
+    # deduplication, so an image referenced in ten places is printed ten
+    # times. The count in the output is references, not distinct
+    # dependencies.
     def find_dependencies(data):
         if isinstance(data, dict):
             for value in data.values():
@@ -143,8 +148,17 @@ def _is_external_dependency(value):
     lowered = text.lower()
     bare = lowered.split("?", 1)[0].split("#", 1)[0]
 
+    # Registry markers match as substrings anywhere in the string. A
+    # comment, a hostname that merely contains one of the markers, or a
+    # documentation URL all count. The image patterns below are nearly as
+    # wide: any name:tag shaped string qualifies, including a host:port
+    # pair, so this check is a net for candidates, not a confirmation.
     if any(marker in lowered for marker in _REGISTRY_MARKERS):
         return True
+    # Only script suffixes make a plain URL a dependency, because those
+    # are the ones that can carry code into an install. The query string
+    # and fragment are stripped first, in the bare value above, so a
+    # tracker parameter cannot hide the suffix, or fake one.
     if lowered.startswith(("http://", "https://")) and bare.endswith((".sh", ".ps1", ".py")):
         return True  # potential for running code on install
     if lowered.startswith(("git::", "github.com/", "git@")):
@@ -217,6 +231,10 @@ def validate_security_configuration(iac_data, policy_data):
     # Check the schema itself first. An invalid schema raises
     # jsonschema's SchemaError here, so a policy that cannot be applied
     # never reads as a clean pass in main.
+    # validator_for picks the validator class from the schema's own
+    # $schema declaration, defaulting to the newest draft it knows. The
+    # same policy file can therefore be applied under different draft
+    # rules depending on what it declares about itself.
     validator_class = validators.validator_for(policy_data)
     validator_class.check_schema(policy_data)
 
